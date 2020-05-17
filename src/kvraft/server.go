@@ -12,6 +12,7 @@ import "time"
 import "context"
 import "crypto/sha256"
 import "fmt"
+import "bytes"
 
 const Debug = 0
 
@@ -40,10 +41,10 @@ type KVServer struct {
 	dead    		int32 				// set by Kill()
 	maxraftstate 	int 				// snapshot if log grows this big
 
-	lastCommit 		map[int64]int64 	// maps clerk to its last commit to prevent double commit
-	committed 		map[string]bool 	// whether an op with said hash has been commited
-	KVStore 		map[string]string 	// committed KV pairs
-	reserved 		int64 				// increasing seq.no. for commited entries
+	LastCommit 		map[int64]int64 	// maps clerk to its last commit to prevent double commit
+	Committed 		map[string]bool 	// whether an op with said hash has been Committed
+	KVStore 		map[string]string 	// Committed KV pairs
+	Reserved 		int64 				// increasing seq.no. for Committed entries
 }
 
 func asSha256(o interface{}) string {
@@ -131,7 +132,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 
-	if kv.lastCommit[args.ClerkId] == args.Id {
+	if kv.LastCommit[args.ClerkId] == args.Id {
 		kv.mu.Unlock()
 		reply.Err = OK
 		return
@@ -169,9 +170,25 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) TakeSnapshotAndSend(index int) {
+	/*----------------------------------------------------------------------------------*
+	 * Takes a snapshot of the current state and sends it to kv.rf for persisting, when *
+	 * the raft state grows too big. kv.mu.Lock() must be held when calling this func.  *
+	 *----------------------------------------------------------------------------------*/
+
+	 buf := new(bytes.Buffer)
+	 encoder := labgob.NewEncoder(buf)
+	 encoder.Encode(kv.LastCommit)
+	 // encoder.Encode(kv.Committed)
+	 encoder.Encode(kv.KVStore)
+	 encoder.Encode(kv.Reserved)
+
+	 go kv.rf.CreateSnapshot(buf.Bytes(), index)
+}
+
 func (kv *KVServer) HandlePut(key string, value string) {
 	/*-----------------------------------------------------------------------------------*
-	 * Handles a single Put message commited by kv.rf. kv.mu.Lock() must be held when    *
+	 * Handles a single Put message Committed by kv.rf. kv.mu.Lock() must be held when    *
 	 * calling this function. 															 *
 	 *-----------------------------------------------------------------------------------*/
 
@@ -180,7 +197,7 @@ func (kv *KVServer) HandlePut(key string, value string) {
 
 func (kv *KVServer) HandleAppend(key string, value string) {
 	/*-----------------------------------------------------------------------------------*
-	 * Handles a single Append message commited by kv.rf. kv.mu.Lock() must be held when *
+	 * Handles a single Append message Committed by kv.rf. kv.mu.Lock() must be held when *
 	 * calling this function. 															 *
 	 *-----------------------------------------------------------------------------------*/
 
@@ -193,42 +210,72 @@ func (kv *KVServer) HandleAppend(key string, value string) {
 	 kv.KVStore[key] = newValue
 }
 
+func (kv *KVServer) RestoreState(snapshot []byte) {
+	/*-----------------------------------------------------------------------------------*
+	 * Restores state from a previously taken snapshot. 								 *
+	 *-----------------------------------------------------------------------------------*/
+	var fI, fT int 
+
+	buf := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(buf)
+
+	decoder.Decode(&fI)
+	decoder.Decode(&fT)
+	decoder.Decode(&kv.LastCommit)
+	// decoder.Decode(&kv.Committed)
+	decoder.Decode(&kv.KVStore)
+	decoder.Decode(&kv.Reserved)
+}
+
 func (kv *KVServer) HandleOneMsg(op raft.ApplyMsg) {
 	/*-----------------------------------------------------------------------------------*
-	 * Handles a single ApplyMsg commited by kv.rf.  								     *
+	 * Handles a single ApplyMsg Committed by kv.rf.  								     *
 	 *-----------------------------------------------------------------------------------*/
 
 	 kv.mu.Lock()
 	 defer kv.mu.Unlock()
 
 	 msg := op.Command
-	 ToApply, _ := msg.(Op)
 
-	 digest := asSha256(ToApply)
-	 if _, ok := kv.committed[digest]; ok {
+	 if (!op.CommandValid) {
+	 	kv.RestoreState(msg.([]byte))
 	 	return
 	 }
 
-	 if (ToApply.TypeOfMsg == "Put" && kv.lastCommit[ToApply.ClerkId] != ToApply.Id) {
+	 ToApply, _ := msg.(Op)
+
+	 digest := asSha256(ToApply)
+	 if _, ok := kv.Committed[digest]; ok {
+	 	go func(ch chan bool) {
+	 		ch <- true
+	 	} (ToApply.ListenChan)
+	 	return
+	 }
+
+	 if (ToApply.TypeOfMsg == "Put" && kv.LastCommit[ToApply.ClerkId] != ToApply.Id) {
 	 	kv.HandlePut(ToApply.Key, ToApply.Value)
-	 	kv.lastCommit[ToApply.ClerkId] = ToApply.Id
-	 } else if (ToApply.TypeOfMsg == "Append" && kv.lastCommit[ToApply.ClerkId] != ToApply.Id) {
+	 	kv.LastCommit[ToApply.ClerkId] = ToApply.Id
+	 } else if (ToApply.TypeOfMsg == "Append" && kv.LastCommit[ToApply.ClerkId] != ToApply.Id) {
 	 	kv.HandleAppend(ToApply.Key, ToApply.Value)
-	 	kv.lastCommit[ToApply.ClerkId] = ToApply.Id
+	 	kv.LastCommit[ToApply.ClerkId] = ToApply.Id
 	 } else {
 	 	// do nothing for get
 	 }
 
-	 kv.committed[digest] = true
+	 // might as well also check for raft state size
+	 if (kv.maxraftstate > 0 && kv.rf.GetRaftStateSize() > kv.maxraftstate) {
+	 	kv.TakeSnapshotAndSend(op.CommandIndex)
+	 }
+
+	 kv.Committed[digest] = true
 	 go func(ch chan bool) {
 	 	ch <- true
-	 	close(ch)
 	 } (ToApply.ListenChan)
 }
 
 func (kv *KVServer) ListenLoop() {
 	/*-----------------------------------------------------------------------------------*
-	 * Runs forever and listens for incoming committed messages, applying them to state. *
+	 * Runs forever and listens for incoming Committed messages, applying them to state. *
 	 *-----------------------------------------------------------------------------------*/
 
 	 forever := make(chan bool)
@@ -249,8 +296,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	kv.lastCommit = make(map[int64]int64)
-	kv.committed = make(map[string]bool)
+	kv.LastCommit = make(map[int64]int64)
+	kv.Committed = make(map[string]bool)
 	kv.KVStore = make(map[string]string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
