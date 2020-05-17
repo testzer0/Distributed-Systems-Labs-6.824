@@ -7,7 +7,7 @@ import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	id 		int64
 }
 
 func nrand() int64 {
@@ -20,40 +20,63 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.id = nrand()
 	return ck
 }
 
-//
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
+	/*--------------------------------------------------------------------*
+	 * Retreives the value mapped to by key. Tries each server in turn    *
+	 * until it finds a leader. In case of ErrWrongTerm, si is still the  *
+	 * leader but not in the same term, so we do not change si for the    *
+	 * next loop iteration. Otherwise, we always increment si. 			  *
+	 *--------------------------------------------------------------------*/
+	 args := GetArgs{
+	 	ck.id,
+		key,
+	 }
 
-	// You will have to modify this function.
-	return ""
+	 for {
+		si := 0
+		for (si < len(ck.servers)) {
+			reply := GetReply{}
+			ok := ck.servers[si].Call("KVServer.Get", &args, &reply)
+			if (ok && reply.Err == OK || reply.Err == ErrNoKey) {
+				return reply.Value
+			} else if ((!ok) || reply.Err != ErrWrongTerm) {
+				si++
+			}
+		}
+	 }
+
+	 return ""
 }
 
-//
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	/*--------------------------------------------------------------------*
+	 * Sends a Put/Append request for consensus, and returns when consen- *
+	 * sus has been acheived.  											  *
+	 *--------------------------------------------------------------------*/
+	 args := PutAppendArgs{
+	 	ck.id,
+	 	nrand(),
+		key,
+		value,
+		op,
+	 }
+
+	 for {
+		si := 0
+		for (si < len(ck.servers)) {
+			reply := PutAppendReply{}
+			ok := ck.servers[si].Call("KVServer.PutAppend", &args, &reply)
+			if (ok && reply.Err == OK) {
+				return 
+			} else if ((!ok) || reply.Err != ErrWrongTerm) {
+				si++
+			}
+		}
+	 }
 }
 
 func (ck *Clerk) Put(key string, value string) {

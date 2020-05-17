@@ -8,6 +8,10 @@ import (
 	"sync"
 	"sync/atomic"
 )
+import "time"
+import "context"
+import "crypto/sha256"
+import "fmt"
 
 const Debug = 0
 
@@ -20,46 +24,144 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	ListenChan 		chan bool 		 	// channel to listen on for commit()ed messages
+	TypeOfMsg 		string 				// type of message
+	Key 			string 				// used by PutAppend and Get
+	Value 			string 				// used by PutAppend
+	Id 				int64
+	ClerkId 		int64
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu     			sync.Mutex
+	me      		int
+	rf      		*raft.Raft
+	applyCh 		chan raft.ApplyMsg
+	dead    		int32 				// set by Kill()
+	maxraftstate 	int 				// snapshot if log grows this big
 
-	maxraftstate int // snapshot if log grows this big
-
-	// Your definitions here.
+	lastCommit 		map[int64]int64 	// maps clerk to its last commit to prevent double commit
+	committed 		map[string]bool 	// whether an op with said hash has been commited
+	KVStore 		map[string]string 	// committed KV pairs
+	reserved 		int64 				// increasing seq.no. for commited entries
 }
 
+func asSha256(o interface{}) string {
+    h := sha256.New()
+    h.Write([]byte(fmt.Sprintf("%v", o)))
+
+    return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func (kv *KVServer) StartConsensusAndWait(op Op) int {
+	/*--------------------------------------------------------------------*
+	 * Starts consensus on said op and waits for raft peers to convene.   *
+	 * If consensus fails due to any reason, returns a bare-bones error   *
+	 * code. kv.mu.Lock() must NOT be held when calling this function.    *
+	 *--------------------------------------------------------------------*/
+
+	 listen := op.ListenChan
+
+	 _, term, leader := kv.rf.Start(op)
+
+	 if (!leader) {
+	 	return 1
+	 }
+
+	 for {
+	 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(10)*time.Millisecond)
+
+	 	select {
+	 		case <-ctx.Done():
+	 			cancel()
+	 			nowTerm, stillLeader := kv.rf.GetState()
+	 			if (!stillLeader) {
+	 				return 1
+	 			} else if (nowTerm != term) {
+	 				return 2
+	 			} else {
+	 				continue
+	 			}
+
+	 		case <-listen:
+	 			cancel()
+	 			return 0
+	 	}
+	 }
+
+	 return 0
+
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+
+	op := Op{
+		make(chan bool),
+		"Get",
+		args.Key,
+		"",
+		0,
+		0,
+	}
+
+	kv.mu.Unlock()
+
+	ret := kv.StartConsensusAndWait(op)
+
+	if (ret == 0) { 		// success
+		reply.Err = OK
+		kv.mu.Lock()
+
+		value, ok := kv.KVStore[args.Key]
+		if(!ok) {
+			value = ""
+			reply.Err = ErrNoKey
+		}
+		reply.Value = value
+
+		kv.mu.Unlock()
+	} else if (ret == 1) {
+		reply.Err = ErrWrongLeader
+	} else {
+		reply.Err = ErrWrongTerm
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+
+	if kv.lastCommit[args.ClerkId] == args.Id {
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
+	}
+
+	op := Op{
+		make(chan bool),
+		args.Op,
+		args.Key,
+		args.Value,
+		args.Id,
+		args.ClerkId,
+	}
+
+	kv.mu.Unlock()
+
+	ret := kv.StartConsensusAndWait(op)
+
+	if (ret == 0) {
+		reply.Err = OK
+	} else if (ret == 1) {
+		reply.Err = ErrWrongLeader
+	} else {
+		reply.Err = ErrWrongTerm
+	}
 }
 
-//
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
-//
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -67,35 +169,94 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
-//
+func (kv *KVServer) HandlePut(key string, value string) {
+	/*-----------------------------------------------------------------------------------*
+	 * Handles a single Put message commited by kv.rf. kv.mu.Lock() must be held when    *
+	 * calling this function. 															 *
+	 *-----------------------------------------------------------------------------------*/
+
+	 kv.KVStore[key] = value
+}
+
+func (kv *KVServer) HandleAppend(key string, value string) {
+	/*-----------------------------------------------------------------------------------*
+	 * Handles a single Append message commited by kv.rf. kv.mu.Lock() must be held when *
+	 * calling this function. 															 *
+	 *-----------------------------------------------------------------------------------*/
+
+	 prevValue, ok := kv.KVStore[key]
+	 if (!ok) {
+	 	prevValue = ""
+	 }
+
+	 newValue := prevValue + value
+	 kv.KVStore[key] = newValue
+}
+
+func (kv *KVServer) HandleOneMsg(op raft.ApplyMsg) {
+	/*-----------------------------------------------------------------------------------*
+	 * Handles a single ApplyMsg commited by kv.rf.  								     *
+	 *-----------------------------------------------------------------------------------*/
+
+	 kv.mu.Lock()
+	 defer kv.mu.Unlock()
+
+	 msg := op.Command
+	 ToApply, _ := msg.(Op)
+
+	 digest := asSha256(ToApply)
+	 if _, ok := kv.committed[digest]; ok {
+	 	return
+	 }
+
+	 if (ToApply.TypeOfMsg == "Put" && kv.lastCommit[ToApply.ClerkId] != ToApply.Id) {
+	 	kv.HandlePut(ToApply.Key, ToApply.Value)
+	 	kv.lastCommit[ToApply.ClerkId] = ToApply.Id
+	 } else if (ToApply.TypeOfMsg == "Append" && kv.lastCommit[ToApply.ClerkId] != ToApply.Id) {
+	 	kv.HandleAppend(ToApply.Key, ToApply.Value)
+	 	kv.lastCommit[ToApply.ClerkId] = ToApply.Id
+	 } else {
+	 	// do nothing for get
+	 }
+
+	 kv.committed[digest] = true
+	 go func(ch chan bool) {
+	 	ch <- true
+	 	close(ch)
+	 } (ToApply.ListenChan)
+}
+
+func (kv *KVServer) ListenLoop() {
+	/*-----------------------------------------------------------------------------------*
+	 * Runs forever and listens for incoming committed messages, applying them to state. *
+	 *-----------------------------------------------------------------------------------*/
+
+	 forever := make(chan bool)
+
+	 go func(kv *KVServer) {
+	 	for msg := range kv.applyCh {
+	 		kv.HandleOneMsg(msg)
+	 	}
+	 } (kv)
+
+	 <-forever
+
+}
+
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
+	kv.lastCommit = make(map[int64]int64)
+	kv.committed = make(map[string]bool)
+	kv.KVStore = make(map[string]string)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.ListenLoop()
 
 	return kv
 }
